@@ -1,0 +1,624 @@
+#!/usr/bin/env bash
+
+################
+#  Credit
+################
+#
+#  This script is a combination of the following scripts, with a few additions to make it easier to consume
+#  from a gitlab pipeline.
+# 
+#  github.com/hashicorp/terraform-guides/blob/master/operations/automation-script/loadAndRunWorkspace.sh
+#  github.com/hashicorp/terraform-guides/blob/master/operations/variable-scripts/set-variables.sh
+#  github.com/hashicorp/terraform-guides/blob/master/operations/variable-scripts/delete-variables.sh
+# 
+#  For example usage, see ./README.md
+
+#################
+#  Connection
+#################
+#  TFE_TOKEN
+#  TFE_ORG
+#  TFE_ADDR
+#  TFE_WORKSPACE_NAME
+
+#################
+#  Artifacts 
+#################
+#  TFE_CONFIG_DIR
+#  TFE_VARIABLES_FILE
+
+#################
+#  Configurables
+#################
+#  TFE_ACTION
+#  TFE_SET_VARIABLES_FORCE
+#  TFE_SAVE_PLAN
+#  TFE_SLEEP_INTERVAL
+#  TFE_VARIABLES_FILE_DELIMITER
+#  TFE_AUTO_APPROVE
+#  TFE_TERRAFORM_VERSION
+
+
+LOG_OUT () {
+  echo "`date "+%Y%m%d-%H%M%S"` $1: $2"
+}
+ 
+# Check env vars that they have been defined
+TFE_ENV=(
+ "TFE_TOKEN"
+ "TFE_ORG"
+ "TFE_ADDR"
+ "TFE_WORKSPACE_NAME"
+ "TFE_CONFIG_DIR"
+ "TFE_VARIABLES_FILE"
+ "TFE_ACTION"
+ "TFE_SET_VARIABLES_FORCE"
+ "TFE_SAVE_PLAN"
+ "TFE_SLEEP_INTERVAL"
+ "TFE_VARIABLES_FILE_DELIMITER"
+ "TFE_AUTO_APPROVE"
+ "TFE_TERRAFORM_VERSION"
+)
+
+# Check that each of environment variables listed in `TFE_ENV` have been set, if ANY of them have not then fail.
+# No default values are provided
+
+for i in ${TFE_ENV[@]}; do
+  LOG_OUT "INFO" "Checking if the ${i} environment variable has been set."
+  if [ ! -z "$(eval "echo \$$i")" ]; then
+    LOG_OUT "INFO" "${i} environment variable was found."
+  else
+    LOG_OUT "INFO" "${i} environment variable was NOT set. You must export/set the ${i} environment variable."
+    LOG_OUT "FATAL" "Exiting."
+    exit
+  fi
+done
+
+# TFE_VAR_
+# For each environment variable beginning with `TFE_VAR_` add it to the variables.csv file, which will
+# later be uploaded to the workspace as TERRAFORM variables.
+IFS=$'\n'
+for i in $(env | grep TFE_VAR_); do 
+  LOG_OUT "INFO" "${i} terraform variable found"
+  KEY="$(echo  "${i}" | cut -d \_ -f 3-| cut -d \= -f 1)"
+  VALUE="$(echo "${i}" | cut -d \= -f 2-)"
+  LOG_OUT "INFO" "KEY: $KEY"
+  LOG_OUT "INFO" "VALUE: $VALUE"
+  echo "${KEY};${VALUE};terraform;false;false;description" >> ${TFE_VARIABLES_FILE}
+done
+
+# TFE_ENV_VAR
+# For each environment variable beginning with `TFE_ENV_VAR_` add it to the variables.csv file, which will
+# later be uploaded to the workspace as ENVIRONMENT variables.
+# todo. add error checking if no var name has been set. eg.`TFE_ENV_VAR: blah`
+IFS=$'\n'
+for i in $(env | grep TFE_ENV_VAR_); do 
+  echo ${i}
+  LOG_OUT "INFO" "${i} terraform env variable found"
+  KEY="$(echo  "${i}" | cut -d \_ -f 4-| cut -d \= -f 1)"
+  VALUE="$(echo "${i}" | cut -d \= -f 2-)"
+  LOG_OUT "INFO" "KEY: $KEY"
+  LOG_OUT "INFO" "VALUE: $VALUE"
+  echo "${KEY};${VALUE};env;false;true;description" >> ${TFE_VARIABLES_FILE}
+done
+
+# Map configurables from pre-existing scripts to the env vars that we have set.
+address=$TFE_ADDR
+token=$TFE_TOKEN
+config_dir="$TFE_CONFIG_DIR"
+variables_file="$TFE_VARIABLES_FILE"
+workspace="$TFE_WORKSPACE_NAME"
+organization="$TFE_ORG"
+sleep_duration="$TFE_SLEEP_INTERVAL"
+delete_first="$TFE_SET_VARIABLES_FORCE"
+delimiter="$TFE_VARIABLES_FILE_DELIMITER"
+save_plan="$TFE_SAVE_PLAN"
+override="$TFE_AUTO_APPROVE"
+
+# Make sure $workspace does not have spaces
+if [[ "${workspace}" != "${workspace% *}" ]] ; then
+    echo "The workspace name cannot contain spaces."
+    echo "Please pick a name without spaces and run again."
+    exit
+fi
+
+# Tar and compress the configuration directory
+LOG_OUT "INFO" "Tarring configuration directory."
+tar -czf ${config_dir}.tar.gz -C ${config_dir} --exclude .git .
+
+# Write out workspace.template.json
+cat > workspace.template.json <<EOF
+{
+  "data":
+  {
+    "attributes": {
+      "name":"$TFE_WORKSPACE_NAME",
+      "terraform-version": "$TFE_TERRAFORM_VERSION"
+    },
+    "type":"workspaces"
+  }
+}
+EOF
+
+# Write out configversion.json
+cat > configversion.json <<EOF
+{
+  "data": {
+    "type": "configuration-versions",
+    "attributes": {
+      "auto-queue-runs": false
+    }
+  }
+}
+EOF
+
+# Write out run.template.json
+cat > run.template.json <<EOF
+{
+  "data": {
+    "attributes": {
+      "is-destroy":false
+    },
+    "type":"runs",
+    "relationships": {
+      "workspace": {
+        "data": {
+          "type": "workspaces",
+          "id": "workspace_id"
+        }
+      }
+    }
+  }
+}
+EOF
+
+cat > run.destroy.template.json <<EOF
+{
+  "data": {
+    "attributes": {
+      "is-destroy":true
+    },
+    "type":"runs",
+    "relationships": {
+      "workspace": {
+        "data": {
+          "type": "workspaces",
+          "id": "workspace_id"
+        }
+      }
+    }
+  }
+}
+EOF
+
+# Write variable.template.json to file
+cat > variable.template.json <<EOF
+{
+  "data": {
+    "type":"vars",
+    "attributes": {
+      "key":"my-key",
+      "value":"my-value",
+      "category":"my-category",
+      "hcl":my-hcl,
+      "sensitive":my-sensitive,
+      "description":"my-description"
+    }
+  },
+  "relationships": {
+    "workspace": {
+      "data": {
+        "id":"my-workspace",
+        "type":"workspaces"
+      }
+    }
+  }
+}
+EOF
+
+# Write out apply.json
+cat > apply.json <<EOF
+{"comment": "apply via API"}
+EOF
+
+# Check to see if the workspace already exists
+LOG_OUT "INFO" "Checking to see if workspace ${TFE_WORKSPACE_NAME} exists in the organization ${TFE_ORG}"
+check_workspace_result=$(curl \
+                           -s \
+                           --header "Authorization: Bearer $TFE_TOKEN" \
+                           --header "Content-Type: application/vnd.api+json" \
+                           "https://${TFE_ADDR}/api/v2/organizations/${TFE_ORG}/workspaces/${TFE_WORKSPACE_NAME}")
+
+check_workspace_result_code=$(curl \
+                               -s \
+                               --write-out '%{http_code}' \
+                               --output /dev/null \
+                               --header "Authorization: Bearer $TFE_TOKEN" \
+                               --header "Content-Type: application/vnd.api+json" \
+                               "https://${TFE_ADDR}/api/v2/organizations/${TFE_ORG}/workspaces/${TFE_WORKSPACE_NAME}")
+
+# If the workspace exists, parse the workspace ID
+if [ "$check_workspace_result_code" == "200" ]; then
+
+  LOG_OUT "INFO" "Workspace ${TFE_WORKSPACE_NAME} found"
+  # Parse workspace_id from check_workspace_result
+  workspace_id=$(echo $check_workspace_result | python -c "import sys, json; print(json.load(sys.stdin)['data']['id'])")
+  LOG_OUT "INFO" "Workspace ID:  $workspace_id"
+
+# If the workspace does not exist, create it then parse the workspace ID
+elif [ "$check_workspace_result_code" == "404" ]; then
+
+  LOG_OUT "INFO" "Workspace ${TFE_WORKSPACE_NAME} did not already exist; i will create it."
+  workspace_result=$(curl \
+                       -s \
+                       --header "Authorization: Bearer $TFE_TOKEN" \
+                       --header "Content-Type: application/vnd.api+json" \
+                       --request POST \
+                       --data @workspace.template.json \
+                       "https://${TFE_ADDR}/api/v2/organizations/${TFE_ORG}/workspaces")
+  # Parse workspace_id from workspace_result
+  workspace_id=$(echo $workspace_result | python -c "import sys, json; print(json.load(sys.stdin)['data']['id'])")
+  LOG_OUT "INFO" "Created ${TFE_WORKSPACE_NAME} sucessfully"
+  LOG_OUT "INFO" "Workspace ID:  $workspace_id"
+
+# Exist if when checking if the workspace exists returns anything other than a 200 or 404.
+else
+
+  LOG_OUT "FATAL" "Unknown return code"
+  exit 1;
+fi
+
+
+# Create configuration version
+LOG_OUT "INFO" "Creating configuration version"
+configuration_version_result=$(curl \
+                                 -s \
+                                 --header "Authorization: Bearer $TFE_TOKEN" \
+                                 --header "Content-Type: application/vnd.api+json" \
+                                 --data @configversion.json \
+                                 "https://${TFE_ADDR}/api/v2/workspaces/${workspace_id}/configuration-versions")
+
+# Parse configuration_version_id and upload_url
+config_version_id=$(echo $configuration_version_result | python -c "import sys, json; print(json.load(sys.stdin)['data']['id'])")
+upload_url=$(echo $configuration_version_result | python -c "import sys, json; print(json.load(sys.stdin)['data']['attributes']['upload-url'])")
+LOG_OUT "INFO" "Config Version ID: $config_version_id"
+
+# Upload configuration
+LOG_OUT "INFO" "Uploading configuration version using ${config_dir}.tar.gz"
+curl \
+  -s \
+  --header "Content-Type: application/octet-stream" \
+  --request PUT \
+  --data-binary @${config_dir}.tar.gz \
+  "$upload_url"
+
+
+# Delete all variables in the workspace if $delete_first is true
+if [ "$delete_first" == "true" ]; then
+  echo "Workspace ID: " $workspace_id
+  
+  # Get list of all variables in the workspace
+  list_variables_result=$(curl \
+                            -s \
+                            --header "Authorization: Bearer $TFE_TOKEN" \
+                            --header "Content-Type: application/vnd.api+json" \
+                            "https://${address}/api/v2/vars?filter%5Borganization%5D%5Bname%5D=${organization}&filter%5Bworkspace%5D%5Bname%5D=${workspace}")
+  
+  # python function to extract variable IDs and names
+  parse_ids_and_names() { python -c '
+import sys, json
+parsed = json.load(sys.stdin)
+id_name_category_dict = ",".join(v["id"] + ":" + v["attributes"]["key"] + ":" + v["attributes"]["category"] for v in parsed["data"])
+print(id_name_category_dict)'
+  }
+  
+  # Parse variables from list_variables_result
+  variables_map=$(echo $list_variables_result | parse_ids_and_names)
+  
+  # Delete variables in workspace
+  for v in $(echo $variables_map | sed "s/,/ /g")
+  do
+      # Separate ID, name, and category
+      v_id=$(echo $v | cut -f1 -d":")
+      v_name=$(echo $v | cut -f2 -d":")
+      v_category=$(echo $v | cut -f3 -d":")
+  
+      # Delete variable
+      echo "Deleting ${v_category} variable ${v_name}"
+      curl \
+        -s \
+        --header "Authorization: Bearer $TFE_TOKEN" \
+        --header "Content-Type: application/vnd.api+json" \
+        --request DELETE \
+        "https://${address}/api/v2/vars/${v_id}"
+  done
+  
+  LOG_OUT "INFO" "Deleted all variables"
+fi
+
+# Set variables in workspace
+while IFS=${delimiter} read -r key value category hcl sensitive description
+do
+  # Create variable.json from variable.template.json
+  sed \
+    -e "s/my-workspace/${workspace_id}/" \
+    -e "s/my-key/$key/" \
+    -e "s/my-value/$value/" \
+    -e "s/my-category/$category/" \
+    -e "s/my-hcl/$hcl/" \
+    -e "s/my-sensitive/$sensitive/" \
+    -e "s/my-description/$description/" < variable.template.json  > variable.json
+
+  # Make the API call to set the variable
+  LOG_OUT "INFO" "Setting $category variable $key with value REDACTED, hcl: $hcl, sensitive: $sensitive, with a description of $description"
+  upload_variable_result=$(curl \
+                             -s \
+                             --header "Authorization: Bearer $token" \
+                             --header "Content-Type: application/vnd.api+json" \
+                             --data @variable.json \
+                             "https://${address}/api/v2/vars?filter%5Borganization%5D%5Bname%5D=${organization}&filter%5Bworkspace%5D%5Bname%5D=${workspace}")
+
+done < ${variables_file}
+
+LOG_OUT "INFO" "Set all variables"
+
+# Function to process special characters in sed
+escape_string()
+{
+  printf '%s' "$2" | sed -e 's/\([&\]\)/\\\1/g'
+}
+
+sedDelim=$(printf '\001')
+
+# List Sentinel Policies
+sentinel_list_result=$(curl -s --header "Authorization: Bearer $TFE_TOKEN" --header "Content-Type: application/vnd.api+json" "https://${address}/api/v2/organizations/${organization}/policies")
+sentinel_policy_count=$(echo $sentinel_list_result | python -c "import sys, json; print(json.load(sys.stdin)['meta']['pagination']['total-count'])")
+echo "Number of Sentinel policies: " $sentinel_policy_count
+
+# Do a run
+if [ "$TFE_ACTION" == "apply" ]; then
+
+  LOG_OUT "INFO" "terraform apply triggered"
+  sed "s/workspace_id/$workspace_id/" < run.template.json  > run.json
+  run_result=$(curl -s --header "Authorization: Bearer $TFE_TOKEN" --header "Content-Type: application/vnd.api+json" --data @run.json https://${address}/api/v2/runs)
+
+elif [ "$TFE_ACTION" == "destroy" ]; then
+
+  LOG_OUT "INFO" "terraform destroy triggered"
+  sed "s/workspace_id/$workspace_id/" < run.destroy.template.json  > run.json
+  run_result=$(curl -s --header "Authorization: Bearer $TFE_TOKEN" --header "Content-Type: application/vnd.api+json" --data @run.json https://${address}/api/v2/runs)
+else
+
+  LOG_OUT "FATAL" "TFE_ACTION should be either 'apply' or destroy. Exiting"
+  exit 1;
+fi
+
+# Parse run_result
+run_id=$(echo $run_result | python -c "import sys, json; print(json.load(sys.stdin)['data']['id'])")
+echo "Run ID: " $run_id
+
+# Check run result in loop
+continue=1
+while [ $continue -ne 0 ]; do
+  # Sleep
+  sleep $sleep_duration
+  echo "Checking run status"
+
+  # Check the status of run
+  check_result=$(curl -s --header "Authorization: Bearer $TFE_TOKEN" --header "Content-Type: application/vnd.api+json" https://${address}/api/v2/runs/${run_id})
+
+  # Parse out the run status and is-confirmable
+  run_status=$(echo $check_result | python -c "import sys, json; print(json.load(sys.stdin)['data']['attributes']['status'])")
+  echo "Run Status: " $run_status
+  is_confirmable=$(echo $check_result | python -c "import sys, json; print(json.load(sys.stdin)['data']['attributes']['actions']['is-confirmable'])")
+  echo "Run can be applied: " $is_confirmable
+
+  # Save plan log in some cases
+  save_plan="false"
+
+  # Apply in some cases
+  applied="false"
+
+  # planned means plan finished and no Sentinel policies
+  # exist or are applicable to the workspace
+
+  # Run is planning - get the plan
+  # Note that we use "True" rather than "true" because python converts the
+  # boolean "true" in json responses to "True" and "false" to "False"
+  if [[ "$run_status" == "cost_estimated" ]] && [[ "$is_confirmable" == "True" ]] && [[ "$override" == "no" ]]; then
+    continue=0
+    sleep $sleep_duration
+    echo "There are " $sentinel_policy_count "policies, but none of them are applicable to this workspace."
+    echo "Check the run in Terraform Enterprise UI and apply there if desired."
+    save_plan="true"
+  # planned means plan finished and no Sentinel policies
+  # exist or are applicable to the workspace
+  elif [[ "$run_status" == "cost_estimated" ]] && [[ "$is_confirmable" == "True" ]] && [[ "$override" == "yes" ]]; then
+      continue=0
+      echo "There are " $sentinel_policy_count "policies, but none of them are applicable to this workspace."
+      echo "Since override was set to \"yes\", we are applying."
+      # Do the apply
+      echo "Doing Apply"
+      apply_result=$(curl -s --header "Authorization: Bearer $TFE_TOKEN" --header "Content-Type: application/vnd.api+json" --data @apply.json https://${address}/api/v2/runs/${run_id}/actions/apply)
+      applied="true"
+
+  # policy_checked means all Sentinel policies passed
+  elif [[ "$run_status" == "policy_checked" ]]; then
+    continue=0
+    # Do the apply
+    echo "Policies passed. Doing Apply"
+    apply_result=$(curl -s --header "Authorization: Bearer $TFE_TOKEN" --header "Content-Type: application/vnd.api+json" --data @apply.json https://${address}/api/v2/runs/${run_id}/actions/apply)
+    applied="true"
+
+  # policy_override means at least 1 Sentinel policy failed
+  # but since $override is "yes", we will override and then apply
+  elif [[ "$run_status" == "policy_override" ]] && [[ "$override" == "yes" ]]; then
+    continue=0
+    echo "Some policies failed, but overriding"
+    # Get the policy check ID
+    echo "Getting policy check ID"
+    policy_result=$(curl -s --header "Authorization: Bearer $TFE_TOKEN" https://${address}/api/v2/runs/${run_id}/policy-checks)
+    # Parse out the policy check ID
+    policy_check_id=$(echo $policy_result | python -c "import sys, json; print(json.load(sys.stdin)['data'][0]['id'])")
+    echo "Policy Check ID: " $policy_check_id
+    # Override policy
+    echo "Overriding policy check"
+    override_result=$(curl -s --header "Authorization: Bearer $TFE_TOKEN" --header "Content-Type: application/vnd.api+json" --request POST https://${address}/api/v2/policy-checks/${policy_check_id}/actions/override)
+    # Do the apply
+    echo "Doing Apply"
+    apply_result=$(curl -s --header "Authorization: Bearer $TFE_TOKEN" --header "Content-Type: application/vnd.api+json" --data @apply.json https://${address}/api/v2/runs/${run_id}/actions/apply)
+    applied="true"
+  # policy_override means at least 1 Sentinel policy failed
+  # but since $override is "no", we will not override
+  # and will not apply
+
+  elif [[ "$run_status" == "policy_override" ]] && [[ "$override" == "no" ]]; then
+    echo "Some policies failed, but will not override. Check run in Terraform Enterprise UI."
+    save_plan="true"
+    continue=0
+
+  # errored means that plan had an error or that a hard-mandatory
+  # policy failed
+  elif [[ "$run_status" == "errored" ]]; then
+    echo "Plan errored or hard-mandatory policy failed"
+    save_plan="true"
+    continue=0
+
+  elif [[ "$run_status" == "planned_and_finished" ]]; then
+    echo "Plan indicates no changes to apply."
+    save_plan="true"
+    continue=0
+
+  elif [[ "run_status" == "canceled" ]]; then
+    echo "The run was canceled."
+    continue=0
+
+  elif [[ "run_status" == "force_canceled" ]]; then
+    echo "The run was canceled forcefully."
+    continue=0
+
+  elif [[ "run_status" == "discarded" ]]; then
+    echo "The run was discarded."
+    continue=0
+
+  else
+    # Sleep and then check status again in next loop
+    echo "We will sleep and try again soon."
+
+  fi
+done
+
+# Get the plan log if $save_plan is true
+if [[ "$save_plan" == "true" ]]; then
+  echo "Getting the result of the Terraform Plan."
+  plan_result=$(curl -s --header "Authorization: Bearer $TFE_TOKEN" --header "Content-Type: application/vnd.api+json" https://${address}/api/v2/runs/${run_id}?include=plan)
+  plan_log_url=$(echo $plan_result | python -c "import sys, json; print(json.load(sys.stdin)['included'][0]['attributes']['log-read-url'])")
+  LOG_OUT "INFO" "Plan Log:"
+  # Retrieve Plan Log from the URL
+  # and output to shell and file
+  curl -s $plan_log_url | tee ${run_id}.log
+fi
+
+# Get the apply log and state files (before and after) if an apply was done
+if [[ "$applied" == "true" ]]; then
+
+  LOG_OUT "INFO" "An apply was done."
+  LOG_OUT "INFO" "Will download apply log and state file."
+
+  # Get run details including apply information
+  check_result=$(curl -s --header "Authorization: Bearer $TFE_TOKEN" --header "Content-Type: application/vnd.api+json" https://${address}/api/v2/runs/${run_id}?include=apply)
+
+  # Get apply ID
+  apply_id=$(echo $check_result | python -c "import sys, json; print(json.load(sys.stdin)['included'][0]['id'])")
+  echo "Apply ID:" $apply_id
+
+  # Check apply status periodically in loop
+  continue=1
+  while [ $continue -ne 0 ]; do
+
+    sleep $sleep_duration
+    echo "Checking apply status"
+
+    # Check the apply status
+    check_result=$(curl -s --header "Authorization: Bearer $TFE_TOKEN" --header "Content-Type: application/vnd.api+json" https://${address}/api/v2/applies/${apply_id})
+
+    # Parse out the apply status
+    apply_status=$(echo $check_result | python -c "import sys, json; print(json.load(sys.stdin)['data']['attributes']['status'])")
+    LOG_OUT "INFO" "Apply Status: ${apply_status}"
+
+    # Decide whether to continue
+    if [[ "$apply_status" == "finished" ]]; then
+      LOG_OUT "INFO" "Apply finished."
+      continue=0
+
+    elif [[ "$apply_status" == "errored" ]]; then
+      LOG_OUT "FATAL" "Apply errored."
+      continue=0
+
+    elif [[ "$apply_status" == "canceled" ]]; then
+      LOG_OUT "INFO" "Apply was canceled."
+      continue=0
+
+    else
+      # Sleep and then check apply status again in next loop
+      LOG_OUT "INFO" "We will sleep and try again soon."
+
+    fi
+  done
+
+  # Get apply log URL
+  apply_log_url=$(echo $check_result | python -c "import sys, json; print(json.load(sys.stdin)['data']['attributes']['log-read-url'])")
+  LOG_OUT "INFO" "Apply Log URL:"
+  echo "${apply_log_url}"
+
+  # Retrieve Apply Log from the URL
+  # and output to shell and file
+  curl -s $apply_log_url | tee ${apply_id}.log
+
+  # Get state version IDs from after the apply
+  state_id_before=$(echo $check_result | python -c "import sys, json; print(json.load(sys.stdin)['data']['relationships']['state-versions']['data'][1]['id'])")
+  echo "State ID 1:" ${state_id_before}
+
+  # Call API to get information about the state version including its URL
+  state_file_before_url_result=$(curl -s --header "Authorization: Bearer $TFE_TOKEN" https://${address}/api/v2/state-versions/${state_id_before})
+
+  # Get state file URL from the result
+  state_file_before_url=$(echo $state_file_before_url_result | python -c "import sys, json; print(json.load(sys.stdin)['data']['attributes']['hosted-state-download-url'])")
+  LOG_OUT "INFO" "URL for state file before apply:"
+  echo ${state_file_before_url}
+
+  # Retrieve state file from the URL
+  # and output to shell and file
+  LOG_OUT "INFO" "State file before the apply:"
+  curl -s $state_file_before_url | tee ${apply_id}-before.tfstate
+
+  # Get state version IDs from before the apply
+  state_id_after=$(echo $check_result | python -c "import sys, json; print(json.load(sys.stdin)['data']['relationships']['state-versions']['data'][0]['id'])")
+  LOG_OUT "INFO" "State ID 0: ${state_id_after}"
+
+  # Call API to get information about the state version including its URL
+  state_file_after_url_result=$(curl -s --header "Authorization: Bearer $TFE_TOKEN" https://${address}/api/v2/state-versions/${state_id_after})
+
+  # Get state file URL from the result
+  state_file_after_url=$(echo $state_file_after_url_result | python -c "import sys, json; print(json.load(sys.stdin)['data']['attributes']['hosted-state-download-url'])")
+  echo "URL for state file after apply:"
+  echo ${state_file_after_url}
+
+  # Retrieve state file from the URL
+  # and output to shell and file
+  echo "State file after the apply:"
+  curl -s $state_file_after_url | tee ${apply_id}-after.tfstate
+
+fi
+
+# Remove json files
+rm apply.json
+rm configversion.json
+rm run.template.json
+rm run.json
+rm variable.template.json
+rm variable.json
+rm workspace.template.json
+
+echo "Finished"
+

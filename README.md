@@ -92,3 +92,11 @@ destroy:
   script: "echo Running terraform destroy..."
   when: manual
 ```
+
+Example docker command.
+```
+docker run \
+  --env-file .env \
+  jamiewri/terraform-cloud-connect:0.1-11
+```
+
